@@ -439,7 +439,6 @@ def main():
         try: hf_download(repo_id=repo_to_download, filename="conds.pt", local_dir=download_dir, local_dir_use_symlinks=False, cache_dir=model_args.cache_dir)
         except: logger.info("conds.pt not found on Hub or failed to download for this model.")
 
-
         chatterbox_model = ChatterboxTTS.from_local(ckpt_dir=download_dir, device="cpu")
         original_model_dir_for_copy = download_dir
 
@@ -563,7 +562,16 @@ def main():
 
     if training_args.do_train:
         logger.info("*** Training T3 model ***")
-        train_result = trainer_instance.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+        resume_from_checkpoint = training_args.resume_from_checkpoint
+
+        # if value of resume_from_checkpoint is True
+        if resume_from_checkpoint is True:
+            last_checkpoint = None
+            if os.path.isdir(training_args.output_dir):
+                dir_cp = get_last_checkpoint(training_args.output_dir)
+                resume_from_checkpoint = dir_cp if dir_cp else False
+
+        train_result = trainer_instance.train(resume_from_checkpoint=resume_from_checkpoint)
         trainer_instance.save_model()
         
         logger.info("Saving finetuned T3 model weights for ChatterboxTTS...")

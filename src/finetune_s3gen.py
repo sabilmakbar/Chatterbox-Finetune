@@ -1,30 +1,29 @@
-import argparse
-import logging
 import os
-import json
+import logging
+import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union, Any
+from typing import Dict, List, Optional, Any
 
 import torch
-import torch.nn.functional as F
-from torch.utils.data import Dataset
+import datasets
 import torchaudio
+import torch.nn.functional as F
 import torchaudio.transforms as T
-import numpy as np
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import Dataset
+from huggingface_hub import hf_hub_download
 
 from transformers import (
+    set_seed,
+    Trainer,
+    PretrainedConfig,
     HfArgumentParser,
     EarlyStoppingCallback,
-    set_seed,
-    TrainerCallback,
-    Trainer,
-    PretrainedConfig
 )
+from datasets import load_dataset, VerificationMode
+from transformers.trainer_utils import get_last_checkpoint
 from transformers import TrainingArguments as HfTrainingArguments
-from datasets import load_dataset, DatasetDict, VerificationMode, Audio
-import datasets
+
 
 # Chatterbox imports
 from chatterbox.tts import ChatterboxTTS # To load the full model initially
@@ -36,12 +35,14 @@ from chatterbox.models.s3gen.xvector import CAMPPlus # Speaker encoder used by S
 
 logger = logging.getLogger(__name__)
 
+
 # --- Training Arguments (can reuse CustomTrainingArguments) ---
 @dataclass
 class CustomTrainingArguments(HfTrainingArguments):
     early_stopping_patience: Optional[int] = field(
         default=None, metadata={"help": "Enable early stopping."}
     )
+
 
 # --- Model Arguments ---
 @dataclass
@@ -53,6 +54,7 @@ class S3GenModelArguments:
     freeze_speaker_encoder: bool = field(default=True, metadata={"help": "Freeze S3Gen's internal speaker encoder (CAMPPlus)."})
     freeze_s3_tokenizer: bool = field(default=True, metadata={"help": "Freeze S3Gen's internal S3Tokenizer."})
     # The 'flow' part of S3Gen will be trained. HiFiGAN part will be frozen.
+
 
 # --- Data Arguments ---
 @dataclass
@@ -272,6 +274,7 @@ class S3GenFineTuningDataset(Dataset):
             # S3Gen's embed_ref sets prompt_feat_len=None, CausalFlow seems to use prompt_feat.shape[1]
         }
 
+
 # --- S3Gen Data Collator ---
 @dataclass
 class S3GenDataCollator:
@@ -485,11 +488,10 @@ class S3GenFlowForFineTuning(torch.nn.Module):
         seq_length_expand = lengths.unsqueeze(1).expand_as(seq_range_expand)
         return seq_range_expand >= seq_length_expand
 
-    
-
 
 # Global trainer instance
 trainer_instance: Optional[Trainer] = None
+
 
 def main():
     global trainer_instance
@@ -509,10 +511,10 @@ def main():
     if model_args.local_model_dir:
         chatterbox_model = ChatterboxTTS.from_local(ckpt_dir=model_args.local_model_dir, device="cpu")
     else:
-        repo_to_download = model_args.model_name_or_path or REPO_ID # Fallback to default REPO_ID
+        repo_to_download = model_args.model_name_or_path
         download_dir = Path(training_args.output_dir) / "pretrained_chatterbox_download"
         download_dir.mkdir(parents=True, exist_ok=True)
-        from huggingface_hub import hf_hub_download
+
         files_to_download = ["ve.safetensors", "t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json", "conds.pt"]
         for f in files_to_download:
             try: hf_hub_download(repo_id=repo_to_download, filename=f, local_dir=download_dir, local_dir_use_symlinks=False, cache_dir=model_args.cache_dir)
@@ -608,7 +610,16 @@ def main():
     # --- Training ---
     if training_args.do_train:
         logger.info("*** Finetuning S3Gen Flow Model ***")
-        train_result = trainer_instance.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+        resume_from_checkpoint = training_args.resume_from_checkpoint
+
+        # if value of resume_from_checkpoint is True
+        if resume_from_checkpoint is True:
+            last_checkpoint = None
+            if os.path.isdir(training_args.output_dir):
+                dir_cp = get_last_checkpoint(training_args.output_dir)
+                resume_from_checkpoint = dir_cp if dir_cp else False
+
+        train_result = trainer_instance.train(resume_from_checkpoint=resume_from_checkpoint)
         trainer_instance.save_model() # Saves Trainer-wrapped S3GenFlowForFineTuning
         
         logger.info("Saving finetuned S3Gen (flow part) model weights for ChatterboxTTS...")
