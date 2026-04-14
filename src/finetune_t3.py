@@ -1,43 +1,102 @@
-import argparse
-import logging
 import os
 import json
+import logging
+import librosa
+
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Union, Any
 
 import torch
+import numpy as np
 import torch.nn.functional as F
 from torch.utils.data import Dataset
-import librosa
-import numpy as np
-from torch.utils.tensorboard import SummaryWriter
 
 from transformers import (
     HfArgumentParser,
     EarlyStoppingCallback,
     set_seed,
-    TrainerCallback,
     Trainer,
     PretrainedConfig
 )
 from transformers import TrainingArguments as HfTrainingArguments
-from datasets import load_dataset, DatasetDict, VerificationMode, Audio
+from transformers.trainer_utils import get_last_checkpoint
+from datasets import load_dataset, DatasetDict, VerificationMode
 import datasets
 
-from chatterbox.tts import ChatterboxTTS, Conditionals, punc_norm, REPO_ID
 from chatterbox.models.t3.t3 import T3, T3Cond
+from chatterbox.models.s3tokenizer import S3_SR
+from chatterbox.tts import ChatterboxTTS, punc_norm, REPO_ID
 from chatterbox.models.t3.modules.t3_config import T3Config
-from chatterbox.models.s3tokenizer import S3_SR, SPEECH_VOCAB_SIZE
-from chatterbox.models.s3gen import S3GEN_SR
-
-#from chatterbox.utils.t3data_arguments import DataArguments
-#from chatterbox.utils.t3dataset import SpeechFineTuningDataset
 
 
+# ---------------------------------------------------------------------------
+# Monkey-patch T3.loss() with a corrected implementation that:
+#   1. Accepts pre-masked labels from the collator (labels_text / labels_speech)
+#   2. Slices [:, :-1, :] so logit[i] predicts label[i+1] (proper AR shift)
+#   3. Transposes (B, seq, vocab) → (B, vocab, seq) for F.cross_entropy
+#   4. Masks the speech prompt region via labels_speech (already -100 there)
+#   5. Returns (loss_text, loss_speech, speech_logits) as a 3-tuple
+# ---------------------------------------------------------------------------
+def _t3_loss_patched(
+    self,
+    *,
+    t3_cond: T3Cond,
+    text_tokens: torch.LongTensor,        # (B, S_text_padded) incl. BOS & EOS
+    text_token_lens: torch.LongTensor,    # (B,), actual lengthts incl. BOS & EOS
+    speech_tokens: torch.LongTensor,      # (B, S_speech_padded) incl. BOS & EOS
+    speech_token_lens: torch.LongTensor,  # (B,) actual lengths incl. BOS & EOS
+    labels_text: torch.LongTensor,        # (B, S_text_padded-1) pre-masked with -100
+    labels_speech: torch.LongTensor,      # (B, S_speech_padded-1) pre-masked with -100
+):
+    """
+    Compute text and speech cross-entropy using pre-masked labels from the collator.
+    Assumes:
+    - labels_text[t] corresponds to predicting text_tokens[:, 1:] with –100 where ignored
+    - labels_speech[t] corresponds to predicting speech_tokens[:, 1:] with –100 where ignored
+    """
+
+    # 1) Run model to get logits
+    out = self.forward(
+        t3_cond=t3_cond,
+        text_tokens=text_tokens,
+        text_token_lens=text_token_lens,
+        speech_tokens=speech_tokens,
+        speech_token_lens=speech_token_lens,
+        training=True,
+    )
+    # out.text_logits:   (B, S_text_padded, V_text)
+    # out.speech_logits: (B, S_speech_padded, V_speech)
+    IGNORE_ID = -100
+
+    # --- Text Loss (use labels_text directly) ---
+    # Align logits: predict t₁..EOS from inputs [BOS, t₁..]
+    logits_text = out.text_logits[:, :-1, :] # (B, S_text_padded-1, V_text)
+    # labels_text already has shape (B, S_text_padded-1) with –100 where masked
+    logits_text = logits_text.transpose(1, 2).contiguous() # (B, V_text, S_text_padded-1)
+    loss_text = F.cross_entropy(
+        logits_text,
+        labels_text,
+        ignore_index=IGNORE_ID
+    )
+
+    # --- Speech Loss (use labels_speech directly) ---
+    logits_speech = out.speech_logits[:, :-1, :] # (B, S_speech_padded-1, V_speech)
+    # labels_speech already has shape (B, S_speech_padded-1) with –100 where masked
+    logits_speech = logits_speech.transpose(1, 2).contiguous() # (B, V_speech, S_speech_padded-1)
+
+    loss_speech = F.cross_entropy(
+        logits_speech,
+        labels_speech,
+        ignore_index=IGNORE_ID
+    )
+
+    return loss_text, loss_speech, out.speech_logits
 
 
+T3.loss = _t3_loss_patched
 
+# ---------------------------------------------------------------------------
 
 logger = logging.getLogger(__name__)
 
@@ -383,19 +442,16 @@ class T3ForFineTuning(torch.nn.Module):
                                 text_token_lens=text_token_lens,
                                 speech_tokens=speech_tokens,
                                 speech_token_lens=speech_token_lens,
-                                labels_text =labels_text,
+                                labels_text=labels_text,
                                 labels_speech=labels_speech
                                 )
-        
+
         total_loss = loss_text + loss_speech
 
         return total_loss, speech_logits
 
 
-
 trainer_instance: Optional[Trainer] = None
-
-
 
 
 def main():
@@ -462,14 +518,27 @@ def main():
     eval_hf_dataset: Optional[Union[datasets.Dataset, List[Dict[str,str]]]] = None 
 
     if data_args.dataset_name:
-        logger.info(f"Loading dataset '{data_args.dataset_name}' from Hugging Face Hub.")
-        raw_datasets_loaded = load_dataset( # Use a different var name to avoid conflict with outer raw_datasets
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            cache_dir=model_args.cache_dir,
-            verification_mode=verification_mode,
-            # trust_remote_code=True # If dataset script requires it
-        )
+        logger.info(f"Loading dataset '{data_args.dataset_name}'.")
+        try:
+            raw_datasets_loaded = load_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                cache_dir=model_args.cache_dir,
+                verification_mode=verification_mode,
+                # trust_remote_code=True # If dataset script requires it
+            )
+        except ValueError as e:
+            if "save_to_disk" in str(e):
+                from datasets import load_from_disk, Dataset
+                logger.info(f"Detected save_to_disk format, loading with load_from_disk.")
+                _loaded = load_from_disk(data_args.dataset_name)
+                if isinstance(_loaded, Dataset):
+                    logger.info(f"Loaded a Dataset (no splits), wrapping as DatasetDict with split '{data_args.train_split_name}'.")
+                    raw_datasets_loaded = DatasetDict({data_args.train_split_name: _loaded})
+                else:
+                    raw_datasets_loaded = _loaded
+            else:
+                raise
         if data_args.train_split_name not in raw_datasets_loaded:
             raise ValueError(f"Train split '{data_args.train_split_name}' not found. Available: {list(raw_datasets_loaded.keys())}")
         train_hf_dataset = raw_datasets_loaded[data_args.train_split_name]
@@ -559,6 +628,15 @@ def main():
 
     if training_args.label_names is None: trainer_instance.label_names = ["lables"]
 
+    if training_args.local_rank in [-1, 0]:
+        args_to_save = {
+            "model_args": asdict(model_args),
+            "data_args": asdict(data_args),
+        }
+        args_path = Path(training_args.output_dir) / "model_and_data_args.json"
+        with open(args_path, "w") as f:
+            json.dump(args_to_save, f, indent=2)
+        logger.info(f"Saved model_args and data_args to {args_path}")
 
     if training_args.do_train:
         logger.info("*** Training T3 model ***")

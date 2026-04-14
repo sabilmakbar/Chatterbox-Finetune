@@ -7,11 +7,18 @@ name = "chatterbox-finetune"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "chatterbox-tts",
+    "chatterbox-tts==0.1.7",
     "tensorboard",
     "datasets<4.0",
     "accelerate",
     "peft",
-    # since latest Perth hasn't been merged to PyPI regarding missing installation, we need to install from source for nor
-    "Perth @ git+https://github.com/resemble-ai/Perth.git@ce86c49d029f42272c1902eccb675556b9ed2330",
+    "nltk>=3.9.4",
+    # since latest Perth hasn't been merged to PyPI regarding missing installation, we need to install from source for now
+    "resemble-perth @ git+https://github.com/resemble-ai/Perth.git@ce86c49d029f42272c1902eccb675556b9ed2330",
+]
+
+[project.optional-dependencies]
+notebook = [
+    "ipykernel",
+    "ipywidgets",
 ]

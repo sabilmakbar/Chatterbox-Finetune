@@ -1,8 +1,9 @@
 import os
+import json
 import logging
 import numpy as np
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Any
 
 import torch
@@ -553,8 +554,21 @@ def main():
     logger.info("Loading and processing dataset for S3Gen finetuning...")
     verification_mode = VerificationMode.NO_CHECKS if data_args.ignore_verifications else VerificationMode.BASIC_CHECKS
     if data_args.dataset_name:
-        raw_datasets = load_dataset(data_args.dataset_name, data_args.dataset_config_name,
-                                    cache_dir=model_args.cache_dir, verification_mode=verification_mode)
+        try:
+            raw_datasets = load_dataset(data_args.dataset_name, data_args.dataset_config_name,
+                                        cache_dir=model_args.cache_dir, verification_mode=verification_mode)
+        except ValueError as e:
+            if "save_to_disk" in str(e):
+                from datasets import load_from_disk, Dataset, DatasetDict
+                logger.info(f"Detected save_to_disk format, loading with load_from_disk.")
+                _loaded = load_from_disk(data_args.dataset_name)
+                if isinstance(_loaded, Dataset):
+                    logger.info(f"Loaded a Dataset (no splits), wrapping as DatasetDict with split '{data_args.train_split_name}'.")
+                    raw_datasets = DatasetDict({data_args.train_split_name: _loaded})
+                else:
+                    raw_datasets = _loaded
+            else:
+                raise
         train_hf_dataset = raw_datasets[data_args.train_split_name]
         eval_hf_dataset = raw_datasets.get(data_args.eval_split_name) if data_args.eval_split_name else None
         if training_args.do_eval and not eval_hf_dataset and data_args.eval_split_size > 0 and len(train_hf_dataset) > 1:
@@ -606,6 +620,16 @@ def main():
         callbacks=callbacks if callbacks else None
     )
     if training_args.label_names is None: trainer_instance.label_names = [] # Model handles its own targets
+
+    if training_args.local_rank in [-1, 0]:
+        args_to_save = {
+            "model_args": asdict(model_args),
+            "data_args": asdict(data_args),
+        }
+        args_path = Path(training_args.output_dir) / "model_and_data_args.json"
+        with open(args_path, "w") as f:
+            json.dump(args_to_save, f, indent=2)
+        logger.info(f"Saved model_args and data_args to {args_path}")
 
     # --- Training ---
     if training_args.do_train:
